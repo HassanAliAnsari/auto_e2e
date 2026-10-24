@@ -1,8 +1,8 @@
 # Drive-JEPA: KITScenes evaluation
 
 Evaluate the official **perception-based ViT-L NAVSIM v2 checkpoint with 20 m
-route commands**, without fine-tuning. Only one evaluation script, one
-dependency file and the verified command labels (~40 KB) are needed.
+route commands**, without fine-tuning. This directory contains one script,
+one dependency file and this README; input data is generated locally.
 
 ## Setup (Windows / CUDA)
 
@@ -26,6 +26,26 @@ Accept the [KITScenes access terms][dataset] before downloading data.
 official `drive_jepa_perception_based_agent_vitl_v2.ckpt` under `.benchmark/`.
 Revisions and mandatory checksums are recorded in the evaluator; existing
 source checkouts with a different revision are rejected rather than reset.
+
+## Generate 20 m commands
+
+Commands are not bundled. First obtain **v3.5 scene-navigation exports** at
+`<navigation-root>/<scene_uuid>/scene_navigation.json` for all 117 val scenes.
+These come from AutoE2E's [Lanelet2 navigation preprocessing][navigation].
+Raw KITScenes and the v3.5 mirror do **not** ship these vector-route files;
+reconstructing them is a separate Linux/Lanelet2 step, outside this lean script.
+The published 100 m labels alone cannot supply 20 m commands.
+
+```powershell
+python -m accuracy_benchmark.drive_jepa.eval_kitscenes --generate-commands --navigation-root D:/v3.5_navigation
+```
+
+This reads pinned mirror metadata, verifies every exported route's published
+hash, and applies the 20 m centreline / ±2 m lateral rule. It saves
+`.benchmark/route_inputs_20m/commands.json` and its provenance. The final
+checksum must match the reference evaluation; no future targets are read.
+Mirror shards are cached locally. An existing command/provenance pair can
+instead be supplied with `--command-file path/to/commands.json`.
 
 ## Evaluate
 
@@ -66,11 +86,9 @@ Previously completed, identity-verified results (**ADE / FDE**, metres):
 |---:|---:|---:|---:|---:|
 | 0.715 / 1.345 | 1.455 / 2.917 | 2.266 / 4.774 | 3.177 / 6.880 | N/A |
 
-The bundled labels use 20 m centreline arc length and ±2 m lateral thresholds
-from offline map-matched v3.5 routes whose scene hashes matched the published
-artifacts. They contain no images or future targets. Unknown routes use a
-distinct one-hot category (3,450 samples). Route provenance and checksums are
-embedded in the command file; regeneration tools are outside this lean PR.
+Labels use offline map-matched v3.5 route geometry, not future trajectory
+targets. Unknown routes use a distinct one-hot category (3,450 samples).
+Route provenance and checksums are recorded alongside locally generated commands.
 
 This is a cross-dataset adaptation: KITScenes ego origin and native front
 projection conventions are retained, without an invented rear-axle offset.
@@ -80,3 +98,4 @@ The trained forward computation and strict checkpoint loading are preserved.
 
 [dataset]: https://huggingface.co/datasets/KIT-MRT/KITScenes-Multimodal
 [reference]: https://huggingface.co/AutowareFoundation/auto_e2e/blob/7262c151599c1b5e4a99f0da9c3196ff9ff615fe/evaluations/overlay-replay-v1/kitscenes-val/kitscenes-epoch-5/report.json
+[navigation]: ../../data_parsing/kit_scenes/navigation.py

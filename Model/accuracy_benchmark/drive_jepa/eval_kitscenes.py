@@ -8,8 +8,8 @@ import importlib
 import importlib.util
 import os
 from collections.abc import Mapping
+from collections import Counter
 from contextlib import contextmanager
-import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
 
 import numpy as np
 import torch
@@ -37,9 +38,9 @@ EXPECTED_VAL_SAMPLES = 11035
 EXPECTED_VAL_SAMPLE_UID_SHA256 = (
     "00f824202c97b47ec74561d247e8e30686e5505eef2ad2bc0acba97e41ce9925"
 )
-COMMAND_BUNDLE_SHA256 = (
-    "60cf590769d1b9c765905a62cc4cad8c93a13c2e58adbb308e302f1fa13e1cca"
-)
+# Canonical LF serialization; the original Windows artifact used CRLF.
+COMMANDS_SHA256 = "c3433171b5cb3022ec1d6ad711bcd5ece993fe2801842d0a8a96269d55a554ab"
+MIRROR_REVISION = "7262c151599c1b5e4a99f0da9c3196ff9ff615fe"
 DISPLACEMENT_HORIZON_STEPS = {"1s": 10, "2s": 20, "3s": 30, "4s": 40}
 POPULATION_CAMERAS = (
     "camera_base_front_center",
@@ -535,12 +536,110 @@ def setup(args):
     print("Setup complete. Run the same command without --setup to evaluate.")
 
 
-def load_commands():
-    path = Path(__file__).with_name("commands_20m.json.gz")
-    if file_sha256(path) != COMMAND_BUNDLE_SHA256:
-        raise ValueError("Bundled 20 m command artifact has changed")
-    bundle = json.loads(gzip.decompress(path.read_bytes()))
-    commands = bundle["commands"]
+def command_from_route(route, metadata, lookahead_m=20.0, lateral_threshold_m=2.0):
+    if lookahead_m <= 0 or lateral_threshold_m < 0:
+        raise ValueError("Invalid command geometry thresholds")
+    if not route.valid or not metadata["route_valid"] or not metadata["map_valid"]:
+        return [0.0, 0.0, 0.0, 1.0], {"reason": "invalid_route_or_map"}
+    pose = metadata["sample_pose_enu"]
+    position = np.array([pose["x_enu_m"], pose["y_enu_m"]], dtype=np.float64)
+    yaw = float(pose["yaw_rad"])
+    if not np.isfinite(position).all() or not np.isfinite(yaw):
+        raise ValueError("Non-finite current ego pose")
+    candidates = []
+    for lane_index, lane in enumerate(route.lane_sequence):
+        if lane.lane_id != metadata["current_route_lane_id"]:
+            continue
+        points = np.asarray(lane.centerline_enu_m, dtype=np.float64)[:, :2]
+        if not np.isfinite(points).all():
+            raise ValueError("Non-finite route centreline")
+        for point_index, (a, b) in enumerate(zip(points[:-1], points[1:])):
+            delta = b - a
+            length_squared = float(delta @ delta)
+            if length_squared == 0:
+                continue
+            fraction = np.clip(float((position - a) @ delta) / length_squared, 0, 1)
+            projection = a + fraction * delta
+            candidates.append(
+                (
+                    float(np.linalg.norm(position - projection)),
+                    lane_index,
+                    point_index,
+                    projection,
+                )
+            )
+    if not candidates:
+        return [0.0, 0.0, 0.0, 1.0], {"reason": "active_lane_missing_or_degenerate"}
+    _, lane_index, point_index, start = min(candidates, key=lambda c: c[:3])
+    path = [start]
+    path.extend(
+        np.asarray(route.lane_sequence[lane_index].centerline_enu_m)[
+            point_index + 1 :, :2
+        ]
+    )
+    for lane in route.lane_sequence[lane_index + 1 :]:
+        if (
+            sum(
+                float(np.linalg.norm(np.asarray(b) - np.asarray(a)))
+                for a, b in zip(path[:-1], path[1:])
+            )
+            >= lookahead_m
+        ):
+            break
+        points = np.asarray(lane.centerline_enu_m, dtype=np.float64)[:, :2]
+        if len(points) == 0:
+            continue
+        if not np.isfinite(points).all():
+            raise ValueError("Non-finite route centreline")
+        if np.linalg.norm(np.asarray(path[-1]) - points[0]) > 2.0:
+            # Do not invent a centreline across a lane-change or unresolved gap.
+            return [0.0, 0.0, 0.0, 1.0], {"reason": "discontinuous_route"}
+        path.extend(points)
+    remaining = float(lookahead_m)
+    for a, b in zip(path[:-1], path[1:]):
+        delta = np.asarray(b) - np.asarray(a)
+        length = float(np.linalg.norm(delta))
+        if length == 0:
+            continue
+        if remaining <= length:
+            goal = np.asarray(a) + delta * (remaining / length)
+            relative = goal - position
+            lateral = float(-np.sin(yaw) * relative[0] + np.cos(yaw) * relative[1])
+            slot = (
+                0
+                if lateral > lateral_threshold_m
+                else 2
+                if lateral < -lateral_threshold_m
+                else 1
+            )
+            command = [0.0] * 4
+            command[slot] = 1.0
+            return command, {
+                "reason": "available",
+                "goal_enu_m": goal.tolist(),
+                "goal_lateral_m": lateral,
+            }
+        remaining -= length
+    return [0.0, 0.0, 0.0, 1.0], {"reason": "route_shorter_than_lookahead"}
+
+
+def load_commands(path):
+    if not path.is_file():
+        raise FileNotFoundError(
+            "Generate commands first with --generate-commands --navigation-root PATH"
+        )
+    provenance = json.loads(path.with_suffix(".provenance.json").read_text())
+    if hashlib.sha256(
+        path.read_bytes().replace(b"\r\n", b"\n")
+    ).hexdigest() != COMMANDS_SHA256 or provenance.get(
+        "commands_sha256"
+    ) != file_sha256(path):
+        raise ValueError(
+            "Command checksum differs from the audited v3.5 20 m population"
+        )
+    if provenance.get("command_policy") != "route_centerline_20m_lateral_2m_v1":
+        raise ValueError("Expected the v3.5 20 m route-command policy")
+    commands = json.loads(path.read_text())
     if (
         len(commands) != EXPECTED_VAL_SAMPLES
         or published_digest_ids(commands) != EXPECTED_VAL_SAMPLE_UID_SHA256
@@ -551,7 +650,163 @@ def load_commands():
     for value in commands.values():
         if len(value) != 4 or set(value) - {0.0, 1.0} or sum(value) != 1:
             raise ValueError("Invalid NAVSIM one-hot command")
-    return commands, bundle["provenance"]
+    return commands, provenance
+
+
+def official_val_scenes(sdk_root):
+    if git_revision(sdk_root) != KITSCENES_SDK_REVISION:
+        raise ValueError("KITScenes SDK revision differs")
+    split = (
+        sdk_root
+        / "kitscenes/split/generated_splits/default_geo_split_v1_0/validation.txt"
+    )
+    payload = split.read_bytes().replace(b"\r\n", b"\n")
+    if (
+        hashlib.sha256(payload).hexdigest()
+        != "4a78dd31f4340e0e7953b7c117e83f80d1cd99f22a0ca127c4eb5c60cad70a21"
+    ):
+        raise ValueError("Official validation split has changed")
+    scenes = payload.decode("ascii").split()
+    if len(scenes) != 117 or len(set(scenes)) != 117:
+        raise ValueError("Expected 117 unique validation scenes")
+    return scenes
+
+
+def generate_commands(args):
+    """Convert exported vector routes using pinned published current-sample metadata.
+
+    Route reconstruction is a separate Lanelet2 preprocessing step. This
+    function never reads future ego targets or invents missing route geometry.
+    """
+    from huggingface_hub import hf_hub_download
+    from navigation.artifacts import decode_scene_navigation
+
+    official = set(official_val_scenes(args.sdk_root))
+    missing = [
+        scene
+        for scene in sorted(official)
+        if not (args.navigation_root / scene / "scene_navigation.json").is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing {len(missing)} exported scene_navigation.json files; first: {missing[0]}"
+        )
+
+    def fetch(name):
+        return Path(
+            hf_hub_download(
+                "AutowareFoundation/auto_e2e",
+                "datasets/kitscenes-val/v3.5/shards/" + name,
+                revision=MIRROR_REVISION,
+                local_dir=args.mirror_root,
+            )
+        )
+
+    manifest_path = fetch("manifest.json")
+    manifest = json.loads(manifest_path.read_text())
+    partitions = {
+        p["partition_id"]: p["sample_count"]
+        for p in manifest["partitions"]
+        if "kitscenes-v35-val-" in p["source_uri"]
+    }
+    if len(partitions) != 117 or sum(partitions.values()) != EXPECTED_VAL_SAMPLES:
+        raise ValueError("Published mirror validation population differs")
+    entries = [
+        entry
+        for entry in manifest["shard_entries"]
+        if any(entry["name"].startswith(pid + "-") for pid in partitions)
+    ]
+    if len(entries) != 117:
+        raise ValueError("Expected 117 published validation shards")
+    commands, scene_hashes, reasons = {}, {}, Counter()
+    for index, entry in enumerate(entries, 1):
+        name = entry["name"]
+        if Path(name).name != name or "/" in name or "\\" in name:
+            raise ValueError("Unsafe shard filename")
+        shard = fetch(name)
+        if shard.stat().st_size != entry["byte_size"]:
+            raise ValueError("Shard size differs from pinned manifest")
+        partition = next(pid for pid in partitions if name.startswith(pid + "-"))
+        scene, route, count = None, None, 0
+        with tarfile.open(shard, "r:") as archive:
+            for member in archive:
+                suffix = ".navigation_meta.json"
+                if not member.name.endswith(suffix):
+                    continue
+                if not member.isfile() or member.size > 128 * 1024:
+                    raise ValueError("Invalid navigation metadata member")
+                uid = member.name[: -len(suffix)]
+                sample_scene = uid.removeprefix("kitscenes-v1-").rsplit("-f", 1)[0]
+                if sample_scene not in official or uid in commands:
+                    raise ValueError("Unexpected or duplicate sample identity")
+                if scene is not None and scene != sample_scene:
+                    raise ValueError("Expected one scene per published shard")
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise ValueError("Unreadable navigation metadata")
+                metadata = json.loads(stream.read())
+                if metadata.get("schema_version") != "sample_navigation_v2":
+                    raise ValueError("Published sample metadata schema differs")
+                expected_hash = metadata["scene_navigation_sha256"]
+                if scene is None:
+                    scene = sample_scene
+                    if scene in scene_hashes:
+                        raise ValueError("Duplicate scene partition")
+                    path = args.navigation_root / scene / "scene_navigation.json"
+                    if file_sha256(path) != expected_hash:
+                        raise ValueError(
+                            f"Exported navigation hash differs from published v3.5: {scene}"
+                        )
+                    _, route = decode_scene_navigation(path.read_bytes())
+                    scene_hashes[scene] = expected_hash
+                elif scene_hashes[scene] != expected_hash:
+                    raise ValueError("Published scene hashes disagree")
+                commands[uid], details = command_from_route(route, metadata)
+                reasons[details["reason"]] += 1
+                count += 1
+        if count != partitions[partition]:
+            raise ValueError("Shard sample count differs from pinned manifest")
+        print(f"Generated {index}/117 scenes, {len(commands)} commands", flush=True)
+    if (
+        set(scene_hashes) != official
+        or len(commands) != EXPECTED_VAL_SAMPLES
+        or published_digest_ids(commands) != EXPECTED_VAL_SAMPLE_UID_SHA256
+    ):
+        raise ValueError("Generated command population differs")
+    payload = (
+        json.dumps(commands, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode()
+    if hashlib.sha256(payload).hexdigest() != COMMANDS_SHA256:
+        raise ValueError("Generated 20 m labels differ from the reference evaluation")
+    args.command_file.parent.mkdir(parents=True, exist_ok=True)
+    write_json(args.command_file, commands)
+    write_json(
+        args.command_file.with_suffix(".provenance.json"),
+        {
+            "command_policy": "route_centerline_20m_lateral_2m_v1",
+            "command_order": ["left", "straight", "right", "unknown"],
+            "commands_sha256": file_sha256(args.command_file),
+            "commands_lf_sha256": COMMANDS_SHA256,
+            "scene_count": 117,
+            "sample_count": len(commands),
+            "published_sample_uid_sha256": published_digest_ids(commands),
+            "mirror_revision": MIRROR_REVISION,
+            "manifest_sha256": file_sha256(manifest_path),
+            "scene_navigation_sha256": scene_hashes,
+            "all_scene_navigation_hashes_match_v35": True,
+            "command_counts": dict(
+                Counter(
+                    ["left", "straight", "right", "unknown"][v.index(1.0)]
+                    for v in commands.values()
+                )
+            ),
+            "reason_counts": dict(reasons),
+            "ego_reference": "KITScenes recorded ego-pose origin",
+            "route_provenance": "offline whole-scene map-matched v3.5 routes; exact published hashes verified",
+            "uses_future_ground_truth_for_command_extraction": False,
+        },
+    )
+    print(f"Saved verified commands: {args.command_file}")
 
 
 def evaluate(args):
@@ -561,17 +816,7 @@ def evaluate(args):
         raise ValueError("Drive-JEPA source revision differs")
     if file_sha256(args.checkpoint) != CHECKPOINT_SHA256:
         raise ValueError("Official checkpoint checksum differs")
-    split = (
-        args.sdk_root
-        / "kitscenes/split/generated_splits/default_geo_split_v1_0/validation.txt"
-    )
-    payload = split.read_bytes().replace(b"\r\n", b"\n")
-    if (
-        hashlib.sha256(payload).hexdigest()
-        != "4a78dd31f4340e0e7953b7c117e83f80d1cd99f22a0ca127c4eb5c60cad70a21"
-    ):
-        raise ValueError("Official validation split has changed")
-    official = payload.decode("ascii").split()
+    official = official_val_scenes(args.sdk_root)
     selected = sorted(args.scene or official)
     if (
         len(official) != 117
@@ -579,7 +824,7 @@ def evaluate(args):
         or set(selected) - set(official)
     ):
         raise ValueError("Scenes must be unique official val UUIDs")
-    args.commands, command_provenance = load_commands()
+    args.commands, command_provenance = load_commands(args.command_file)
     identity = {
         "schema": "drive_jepa_v2_route20_v1",
         "sdk_revision": KITSCENES_SDK_REVISION,
@@ -590,7 +835,8 @@ def evaluate(args):
         "auto_e2e_revision": git_revision(REPO_ROOT),
         "selected_scene_ids": selected,
         "evaluator_sha256": file_sha256(Path(__file__)),
-        "command_bundle_sha256": COMMAND_BUNDLE_SHA256,
+        "commands_sha256": file_sha256(args.command_file),
+        "commands_lf_sha256": COMMANDS_SHA256,
         "command_provenance": command_provenance,
         "precision": "fp32",
         "input_policy": INPUT_POLICY,
@@ -681,10 +927,32 @@ def evaluate(args):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument(
         "--setup",
         action="store_true",
         help="Download pinned sources and the official v2 checkpoint, then exit",
+    )
+    action.add_argument(
+        "--generate-commands",
+        action="store_true",
+        help="Convert exported v3.5 vector routes into 20 m commands, then exit",
+    )
+    parser.add_argument(
+        "--navigation-root",
+        type=Path,
+        help="Directory containing <scene_uuid>/scene_navigation.json exports",
+    )
+    parser.add_argument(
+        "--command-file",
+        type=Path,
+        default=WORKSPACE / "route_inputs_20m/commands.json",
+    )
+    parser.add_argument(
+        "--mirror-root",
+        type=Path,
+        default=WORKSPACE / "route_inputs/mirror",
+        help="Local cache for published v3.5 metadata shards",
     )
     parser.add_argument("--sdk-root", type=Path, default=WORKSPACE / "vendor/kitscenes")
     parser.add_argument(
@@ -708,6 +976,10 @@ def parse_args(argv=None):
         help="Val UUID for a labelled subset; repeat to select several",
     )
     args = parser.parse_args(argv)
+    if args.generate_commands and (args.navigation_root is None or args.scene):
+        parser.error(
+            "--generate-commands requires --navigation-root and the full validation split"
+        )
     args.camera = "camera_base_front_center"
     args.precision = "fp32"
     args.dataset_revision = KITSCENES_DATA_REVISION
@@ -718,6 +990,8 @@ def main():
     args = parse_args()
     if args.setup:
         setup(args)
+    elif args.generate_commands:
+        generate_commands(args)
     else:
         print(json.dumps(evaluate(args), indent=2))
 
